@@ -636,6 +636,88 @@ class TriangularPatchesKin(TriangularPatches):
         return np.concatenate(G, axis=1)
 
     # ----------------------------------------------------------------------
+    def buildGeometryKernels(self, data, rebuild, steps, rakes=(0.0, 90.0), **kwargs):
+        '''
+        The sensitivity kernels of the static Green's functions to the geometry of the fault, for
+        the prediction covariance C_p of the uncertainty of the geometry (Ragon et al., 2018):
+        K_i = dG/dp_i for each geometric parameter p_i, by central differences of
+        buildStaticGFs over faults built by {rebuild}. Unlike the uncertainties class, which
+        rotates the patches of a planar fault, the geometry may be any that {rebuild} makes, e.g.
+        a curved slab with a perturbed dip, as long as it keeps the patches and their order.
+
+        Args:
+            * data      : the stations, as for buildStaticGFs
+            * rebuild   : a function of the perturbations of the geometric parameters, keyword
+                          arguments named as in {steps}, returning the fault with that geometry;
+                          all zero is this fault, e.g. lambda dip=0.0: a curved fault with its
+                          dip increased by {dip} degrees
+            * steps     : the finite-difference step of each geometric parameter, e.g.
+                          {'dip': 1.0}, in its own units, the units of the kernels' denominators
+
+        Kwargs:
+            * rakes     : the rakes, as for buildStaticGFs, or a function of the fault returning
+                          them, so that rakes tied to the geometry follow it, e.g.
+                          lambda fault: (fault.convergenceRakes(83) + 90, fault.convergenceRakes(83))
+            * kwargs    : the other arguments of buildStaticGFs, e.g. method='cuokada'
+
+        Returns:
+            * K         : (parameters) x (stations x components) x (rakes x patches), in the
+                          order of {steps}
+        '''
+
+        # Each parameter, perturbed up and down, the others at their nominal values
+        names = list(steps)
+        K = []
+        for name in names:
+            G = []
+            for sign in (1.0, -1.0):
+                fault = rebuild(**{other: sign * steps[name] if other == name else 0.0 for other in names})
+                assert len(fault.patch) == len(self.patch), \
+                    'rebuild must keep the patches of the fault, {} not {}'.format(len(fault.patch), len(self.patch))
+                G.append(fault.buildStaticGFs(data, rakes=rakes(fault) if callable(rakes) else rakes, **kwargs))
+            K.append((G[0] - G[1]) / (2.0 * steps[name]))
+
+        # All done
+        return np.array(K)
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def saveCpKernels(kernels, sigma, kernelfile='static.kernel.h5', covariancefile='static.Cmu.h5'):
+        '''
+        Save the sensitivity kernels of buildGeometryKernels, or of the lines of sight projected
+        from them, and the covariance of their parameters, as AlTar's adaptive C_p reads them:
+        one dataset per parameter in {kernelfile}, named kernel0, kernel1, ..., and the
+        (parameters x parameters) covariance in {covariancefile}
+
+        Args:
+            * kernels       : (parameters) x observations x (rakes x patches)
+            * sigma         : the standard deviation of each parameter, or their covariance
+
+        Kwargs:
+            * kernelfile    : the .h5 file of the kernels
+            * covariancefile: the .h5 file of the covariance
+
+        Returns:
+            * None
+        '''
+
+        import h5py
+
+        kernels = np.asarray(kernels)
+        sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+        covariance = np.diag(sigma ** 2) if sigma.ndim == 1 else sigma
+        assert covariance.shape == (len(kernels), len(kernels)), \
+            'one standard deviation per kernel, or their covariance'
+        with h5py.File(kernelfile, 'w') as h5:
+            for i, kernel in enumerate(kernels):
+                h5['kernel{}'.format(i)] = kernel
+        with h5py.File(covariancefile, 'w') as h5:
+            h5['Cmu'] = covariance
+
+        # All done
+        return
+
+    # ----------------------------------------------------------------------
     def buildBigGD(self, data, Nt, Dt, rakes=(0.0, 90.0), observed=None):
         '''
         The big G of AlTar's kinematic model, one column per time step, rake and patch, in that
