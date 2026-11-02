@@ -22,8 +22,9 @@ The usual sequence:
 
 AlTar computes the rupture times itself, from the hypocenter and the rupture velocities, on a
 mesh refined from these patches. For a forward model here, computeRuptureTimes solves the same
-eikonal equation with fim-python, and castbigM makes AlTar's slip history from the slips {slip},
-rise times {tr} and rupture velocities {vr} of the patches: the data are then bigG @ Mb.
+eikonal equation, with AlTar's compiled model if AlTar is installed, or with fim-python, and
+castbigM makes AlTar's slip history from the slips {slip}, rise times {tr} and rupture velocities
+{vr} of the patches: the data are then bigG @ Mb.
 '''
 
 # Externals
@@ -68,6 +69,7 @@ class TriangularPatchesKin(TriangularPatches):
         # The mesh of the rupture times and the rupture times at the source points
         self.rupture_mesh = None
         self.sources_t0 = None
+        self.slip_history = None
         # Green's functions and big matrices
         self.G = {}
         self.bigG = None
@@ -115,6 +117,7 @@ class TriangularPatchesKin(TriangularPatches):
         self.initializeslip()
         self.computeArea()
         self.rupture_mesh = None
+        self.slip_history = None
 
         # All done
         return
@@ -366,6 +369,7 @@ class TriangularPatchesKin(TriangularPatches):
         self.sources_xyz = np.vstack(xyz)
         self.sources_patch = np.concatenate(patch)
         self.rupture_mesh = None
+        self.slip_history = None
 
         # All done
         return
@@ -761,34 +765,43 @@ class TriangularPatchesKin(TriangularPatches):
         return np.stack([1 - l1 - l2, l1, l2], axis=-1)
 
     # ----------------------------------------------------------------------
-    def computeRuptureTimes(self, refine=10, device='cpu'):
+    def computeRuptureTimes(self, refine=10, device='cpu', engine='auto'):
         '''
         The rupture times from the hypocenter (setHypoOnFault) and the rupture velocity of each
         patch, {vr} in km/s, as AlTar's kinematic model on triangles computes them: the eikonal
-        equation solved on the mesh of buildRuptureMesh by the fast iterative method, with
-        fim-python, the vertices within one edge length of the hypocenter set to their straight
-        ray times; then the times at the source points by barycentric interpolation
+        equation solved on the mesh of buildRuptureMesh by the fast iterative method, the
+        vertices within one edge length of the hypocenter set to their straight ray times; then
+        the times at the source points by barycentric interpolation
+
+        The engines agree to round-off: 'altar', AlTar's compiled model, on the cpu, if AlTar is
+        installed; 'fim', fim-python, on the cpu or the gpu; 'auto', AlTar if installed and on
+        the cpu, fim-python otherwise
 
         Kwargs:
             * refine    : the triangles along each edge of a patch
-            * device    : 'cpu' or 'gpu', where fim-python solves (the gpu needs cupy)
+            * device    : 'cpu' or 'gpu' (fim-python only, with cupy)
+            * engine    : 'auto', 'altar' or 'fim'
 
         Returns:
             * the rupture times at the source points (s), also in self.sources_t0; those at the
               vertices of the mesh are in self.rupture_mesh['times']
         '''
 
-        try:
-            from fimpy.solver import create_fim_solver
-        except ImportError:
-            raise ImportError('computeRuptureTimes needs fim-python: pip install fim-python')
         assert self.hypo_uv is not None, 'set the hypocenter first'
         assert self.vr is not None, 'set the rupture velocities first'
+        engine = self._ruptureEngine(engine, device)
         if self.rupture_mesh is None or self.rupture_mesh['refine'] != refine:
             self.buildRuptureMesh(refine)
         mesh = self.rupture_mesh
         xyz, spacing = mesh['xyz'], mesh['spacing']
         vr = np.asarray(self.vr, dtype=float)
+
+        # AlTar's compiled model
+        if engine == 'altar':
+            self.sources_t0, mesh['times'] = self._slipHistory(refine).arrivals(vr, self.hypo_uv)
+            return self.sources_t0
+
+        from fimpy.solver import create_fim_solver
 
         # The hypocenter on the fault: in the patch that holds it in surface coordinates, or
         # the nearest
@@ -819,7 +832,7 @@ class TriangularPatchesKin(TriangularPatches):
         return self.sources_t0
 
     # ----------------------------------------------------------------------
-    def castbigM(self, Nt, Dt, stf='triangle', peak=0.5, refine=10, device='cpu'):
+    def castbigM(self, Nt, Dt, stf='triangle', peak=0.5, refine=10, device='cpu', engine='auto'):
         '''
         The slip history Mb of AlTar's kinematic model on triangles, in the order of the columns
         of big G, so the data are bigG @ Mb: the rupture times of computeRuptureTimes, and the
@@ -838,7 +851,8 @@ class TriangularPatchesKin(TriangularPatches):
             * stf       : the source time function, 'triangle' or 'cosine' (a raised cosine)
             * peak      : where the triangle peaks, as a fraction of the rise time
             * refine    : the triangles along each edge of a patch, for the rupture times
-            * device    : 'cpu' or 'gpu', where fim-python solves
+            * device    : 'cpu' or 'gpu' (fim-python only, with cupy)
+            * engine    : 'auto', 'altar' or 'fim', as for computeRuptureTimes
 
         Returns:
             * Mb, (Nt x 2 x patches), raveled
@@ -850,8 +864,18 @@ class TriangularPatchesKin(TriangularPatches):
         assert np.array_equal(self.sources_patch, np.repeat(np.arange(Np), Nsp)), \
             'the source points must be stored patch by patch'
 
+        # AlTar's compiled model, and the rupture times from it
+        engine = self._ruptureEngine(engine, device)
+        if engine == 'altar':
+            history = self._slipHistory(refine, Nt, Dt, stf, peak)
+            self.computeRuptureTimes(refine=refine, device=device, engine=engine)
+            return history(np.asarray(self.slip, dtype=float)[:, :2], self.tr, self.vr,
+                           self.hypo_uv).ravel()
+
+        # The rupture times
+        T0 = self.computeRuptureTimes(refine=refine, device=device, engine=engine).reshape(Np, Nsp)
+
         # The time since the rupture time of each source point, at the start of each time step
-        T0 = self.computeRuptureTimes(refine=refine, device=device).reshape(Np, Nsp)
         s = Dt * np.arange(Nt)[None, None, :] - T0[:, :, None]
         Tr = np.broadcast_to(np.asarray(self.tr, dtype=float)[:, None, None], s.shape)
 
@@ -873,6 +897,48 @@ class TriangularPatchesKin(TriangularPatches):
 
         # All done
         return Mb.ravel()
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _ruptureEngine(engine, device):
+        '''
+        The engine of the rupture times: AlTar's compiled model or fim-python
+        '''
+        assert engine in ('auto', 'altar', 'fim'), 'the engine is auto, altar or fim'
+        assert device in ('cpu', 'gpu'), 'the device is cpu or gpu'
+        if engine == 'altar':
+            assert device == 'cpu', "AlTar's slip histories run on the cpu"
+        if engine == 'auto':
+            engine = 'fim'
+            if device == 'cpu':
+                try:
+                    from altar.models.seismic.history import SlipHistory
+                    engine = 'altar'
+                except ImportError:
+                    pass
+        if engine == 'fim':
+            try:
+                import fimpy
+            except ImportError:
+                raise ImportError('the rupture times need AlTar or fim-python: pip install fim-python')
+        return engine
+
+    # ----------------------------------------------------------------------
+    def _slipHistory(self, refine, Nt=None, Dt=None, stf='triangle', peak=0.5):
+        '''
+        AlTar's slip history of the patches, kept until the mesh, the source points or the
+        settings change; any one with the same {refine} for the rupture times alone ({Nt} None)
+        '''
+        from altar.models.seismic.history import SlipHistory
+        key = (refine, Nt, Dt, stf, peak)
+        cached = self.slip_history
+        if cached is not None and (cached[0] == key or (Nt is None and cached[0][0] == refine)):
+            return cached[1]
+        history = SlipHistory(self.Vertices, self.Faces, self.uv, self.sources_uv,
+                              self.sources_patch, Nt=Nt or 1, dt=Dt or 1.0, refine=refine,
+                              stf=stf, peak=peak)
+        self.slip_history = (key, history)
+        return history
 
     # ----------------------------------------------------------------------
     def saveKinematic(self, filename, prefix='kinematicG', dtype=np.float64):
