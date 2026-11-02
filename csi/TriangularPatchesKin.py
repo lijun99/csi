@@ -21,7 +21,9 @@ The usual sequence:
     6. the files AlTar reads (saveKinematic)
 
 AlTar computes the rupture times itself, from the hypocenter and the rupture velocities, on a
-mesh refined from these patches; here, only the geometry and the Green's functions are built.
+mesh refined from these patches. For a forward model here, computeRuptureTimes solves the same
+eikonal equation with fim-python, and castbigM makes AlTar's slip history from the slips {slip},
+rise times {tr} and rupture velocities {vr} of the patches: the data are then bigG @ Mb.
 '''
 
 # Externals
@@ -59,8 +61,13 @@ class TriangularPatchesKin(TriangularPatches):
         self.sources_uv = None
         self.sources_xyz = None
         self.sources_patch = None
-        # Shear modulus of each patch
+        # Shear modulus, rise time and rupture velocity of each patch
         self.mu = None
+        self.tr = None
+        self.vr = None
+        # The mesh of the rupture times and the rupture times at the source points
+        self.rupture_mesh = None
+        self.sources_t0 = None
         # Green's functions and big matrices
         self.G = {}
         self.bigG = None
@@ -107,6 +114,7 @@ class TriangularPatchesKin(TriangularPatches):
         self.z_patches = np.linspace(self.depth, 0.0, 5)
         self.initializeslip()
         self.computeArea()
+        self.rupture_mesh = None
 
         # All done
         return
@@ -357,6 +365,7 @@ class TriangularPatchesKin(TriangularPatches):
         self.sources_uv = np.vstack(uv)
         self.sources_xyz = np.vstack(xyz)
         self.sources_patch = np.concatenate(patch)
+        self.rupture_mesh = None
 
         # All done
         return
@@ -668,6 +677,202 @@ class TriangularPatchesKin(TriangularPatches):
 
         # All done
         return
+
+    # ----------------------------------------------------------------------
+    def buildRuptureMesh(self, refine=10):
+        '''
+        The mesh of the rupture times, as AlTar's kinematic model on triangles makes it: each
+        patch cut into refine x refine triangles, which keep its index, the vertices on shared
+        edges merged; and the triangle of this mesh that holds each source point, with its
+        barycentric weights
+
+        Kwargs:
+            * refine    : the triangles along each edge of a patch
+
+        Returns:
+            * None
+        '''
+
+        assert self.uv is not None, 'set the surface coordinates first'
+        assert self.sources_uv is not None, 'set the source points first'
+
+        # The lattice of the small triangles in the barycentric coordinates of a patch: those
+        # pointing up, then, between them, those pointing down
+        m = refine
+        lattice = [(i, j) for i in range(m + 1) for j in range(m + 1 - i)]
+        index = {ij: k for k, ij in enumerate(lattice)}
+        L = np.array(lattice, dtype=float) / m
+        w = np.column_stack([1 - L.sum(1), L])
+        small = []
+        for i in range(m):
+            for j in range(m - i):
+                small.append((index[i, j], index[i + 1, j], index[i, j + 1]))
+                if i + j < m - 1:
+                    small.append((index[i + 1, j], index[i + 1, j + 1], index[i, j + 1]))
+        small = np.array(small)
+
+        # The points and surface coordinates of each patch's lattice, and its triangles
+        points = np.concatenate([w @ self.Vertices[f] for f in self.Faces])
+        coords = np.concatenate([w @ self.uv[f] for f in self.Faces])
+        triangles = np.concatenate([small + k * len(lattice) for k in range(len(self.Faces))])
+        patch = np.repeat(np.arange(len(self.Faces)), len(small))
+        corners_uv = coords[triangles]
+
+        # Merge the copies of the vertices on shared edges
+        key = np.round(points / (1e-6 * np.abs(points).max()))
+        _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+        xyz, triangles = points[first], inverse.ravel()[triangles]
+
+        # The triangle of each source point, among those of its patch, and its weights
+        corners = np.zeros((len(self.sources_uv), 3), dtype=int)
+        weights = np.zeros((len(self.sources_uv), 3))
+        for p in range(len(self.Faces)):
+            mine = np.flatnonzero(patch == p)
+            q = np.flatnonzero(self.sources_patch == p)
+            bary = self._barycentric(self.sources_uv[q], corners_uv[mine])
+            k = bary.min(axis=2).argmax(axis=1)
+            corners[q] = triangles[mine[k]]
+            weights[q] = bary[np.arange(len(q)), k]
+
+        # The mean length of the edges
+        edges = xyz[triangles[:, [1, 2, 0]]] - xyz[triangles]
+        spacing = np.sqrt((edges ** 2).sum(-1)).mean()
+
+        self.rupture_mesh = {'refine': refine, 'xyz': xyz, 'triangles': triangles,
+                             'patch': patch, 'corners': corners, 'weights': weights,
+                             'spacing': spacing}
+
+        # All done
+        return
+
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _barycentric(points, triangles):
+        '''
+        The barycentric coordinates (npoints x ntriangles x 3) of points (npoints x 2) in
+        triangles (ntriangles x 3 x 2)
+        '''
+        A = triangles[:, 0]
+        v0, v1 = triangles[:, 1] - A, triangles[:, 2] - A
+        den = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
+        d = points[:, None, :] - A[None, :, :]
+        l1 = (d[..., 0] * v1[:, 1] - d[..., 1] * v1[:, 0]) / den
+        l2 = (v0[:, 0] * d[..., 1] - v0[:, 1] * d[..., 0]) / den
+        return np.stack([1 - l1 - l2, l1, l2], axis=-1)
+
+    # ----------------------------------------------------------------------
+    def computeRuptureTimes(self, refine=10, device='cpu'):
+        '''
+        The rupture times from the hypocenter (setHypoOnFault) and the rupture velocity of each
+        patch, {vr} in km/s, as AlTar's kinematic model on triangles computes them: the eikonal
+        equation solved on the mesh of buildRuptureMesh by the fast iterative method, with
+        fim-python, the vertices within one edge length of the hypocenter set to their straight
+        ray times; then the times at the source points by barycentric interpolation
+
+        Kwargs:
+            * refine    : the triangles along each edge of a patch
+            * device    : 'cpu' or 'gpu', where fim-python solves (the gpu needs cupy)
+
+        Returns:
+            * the rupture times at the source points (s), also in self.sources_t0; those at the
+              vertices of the mesh are in self.rupture_mesh['times']
+        '''
+
+        try:
+            from fimpy.solver import create_fim_solver
+        except ImportError:
+            raise ImportError('computeRuptureTimes needs fim-python: pip install fim-python')
+        assert self.hypo_uv is not None, 'set the hypocenter first'
+        assert self.vr is not None, 'set the rupture velocities first'
+        if self.rupture_mesh is None or self.rupture_mesh['refine'] != refine:
+            self.buildRuptureMesh(refine)
+        mesh = self.rupture_mesh
+        xyz, spacing = mesh['xyz'], mesh['spacing']
+        vr = np.asarray(self.vr, dtype=float)
+
+        # The hypocenter on the fault: in the patch that holds it in surface coordinates, or
+        # the nearest
+        bary = self._barycentric(self.hypo_uv[None, :], self.uv[self.Faces])[0]
+        p = bary.min(axis=1).argmax()
+        hypo = bary[p] @ self.Vertices[self.Faces[p]]
+
+        # The seeds: the vertices within one edge length, or else the closest, at the straight
+        # ray time with the fastest of their patches
+        distance = np.sqrt(((xyz - hypo) ** 2).sum(1))
+        seeds = np.flatnonzero(distance <= max(spacing, distance.min()))
+        fastest = np.zeros(len(xyz))
+        np.maximum.at(fastest, mesh['triangles'].ravel(), np.repeat(vr[mesh['patch']], 3))
+
+        # The fast iterative method, one metric v^2 I per triangle
+        metrics = vr[mesh['patch'], None, None] ** 2 * np.eye(3)
+        solver = create_fim_solver(xyz, mesh['triangles'], metrics, precision=np.float64,
+                                   device=device)
+        T = solver.comp_fim(seeds, distance[seeds] / fastest[seeds])
+        if device != 'cpu':
+            T = T.get()
+
+        # The times at the vertices, and at the source points
+        mesh['times'] = T
+        self.sources_t0 = (mesh['weights'] * T[mesh['corners']]).sum(1)
+
+        # All done
+        return self.sources_t0
+
+    # ----------------------------------------------------------------------
+    def castbigM(self, Nt, Dt, stf='triangle', peak=0.5, refine=10, device='cpu'):
+        '''
+        The slip history Mb of AlTar's kinematic model on triangles, in the order of the columns
+        of big G, so the data are bigG @ Mb: the rupture times of computeRuptureTimes, and the
+        slip rate of each source point, a source time function of the rise time of its patch
+        from its rupture time, averaged over the source points of the patch and sampled at the
+        start of each time step, times the slip of the patch along each rake
+
+        The slips along the rakes of buildKinGFs are the first two columns of {slip}, the rise
+        times {tr} (s) and the rupture velocities {vr} (km/s), one for each patch
+
+        Args:
+            * Nt        : the number of rupture time steps
+            * Dt        : the rupture time step (s)
+
+        Kwargs:
+            * stf       : the source time function, 'triangle' or 'cosine' (a raised cosine)
+            * peak      : where the triangle peaks, as a fraction of the rise time
+            * refine    : the triangles along each edge of a patch, for the rupture times
+            * device    : 'cpu' or 'gpu', where fim-python solves
+
+        Returns:
+            * Mb, (Nt x 2 x patches), raveled
+        '''
+
+        assert stf in ('triangle', 'cosine'), 'the source time function is triangle or cosine'
+        Np = len(self.patch)
+        Nsp = self.sources_per_patch
+        assert np.array_equal(self.sources_patch, np.repeat(np.arange(Np), Nsp)), \
+            'the source points must be stored patch by patch'
+
+        # The time since the rupture time of each source point, at the start of each time step
+        T0 = self.computeRuptureTimes(refine=refine, device=device).reshape(Np, Nsp)
+        s = Dt * np.arange(Nt)[None, None, :] - T0[:, :, None]
+        Tr = np.broadcast_to(np.asarray(self.tr, dtype=float)[:, None, None], s.shape)
+
+        # The slip rate, of unit area over the rise time
+        rate = np.zeros(s.shape)
+        inside = (s > 0) & (s < Tr)
+        s, Tr = s[inside], Tr[inside]
+        if stf == 'cosine':
+            rate[inside] = (1 - np.cos(2 * np.pi * s / Tr)) / Tr
+        else:
+            up = s < peak * Tr
+            rate[inside] = np.where(up, 2 * s / (peak * Tr ** 2),
+                                    2 * (Tr - s) / ((1 - peak) * Tr ** 2))
+        rate = rate.mean(axis=1)
+
+        # The slips along each rake
+        slip = np.asarray(self.slip, dtype=float)[:, :2]
+        Mb = rate.T[:, None, :] * slip.T[None, :, :]
+
+        # All done
+        return Mb.ravel()
 
     # ----------------------------------------------------------------------
     def saveKinematic(self, filename, prefix='kinematicG', dtype=np.float64):

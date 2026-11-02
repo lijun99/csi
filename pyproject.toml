@@ -25,6 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+kinematic = [
+	"fim-python",
+]
 docs = [
 	"sphinx>=7",
 	"nbsphinx",
