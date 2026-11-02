@@ -28,6 +28,8 @@ castbigM makes AlTar's slip history from the slips {slip}, rise times {tr} and r
 '''
 
 # Externals
+import contextlib
+import io
 import numpy as np
 
 # Personals
@@ -801,7 +803,9 @@ class TriangularPatchesKin(TriangularPatches):
             self.sources_t0, mesh['times'] = self._slipHistory(refine).arrivals(vr, self.hypo_uv)
             return self.sources_t0
 
-        from fimpy.solver import create_fim_solver
+        # fim-python prints that cupy is missing on import, which only its gpu solver needs
+        with contextlib.redirect_stdout(io.StringIO()):
+            from fimpy.solver import create_fim_solver
 
         # The hypocenter on the fault: in the patch that holds it in surface coordinates, or
         # the nearest
@@ -918,7 +922,8 @@ class TriangularPatchesKin(TriangularPatches):
                     pass
         if engine == 'fim':
             try:
-                import fimpy
+                with contextlib.redirect_stdout(io.StringIO()):
+                    import fimpy
             except ImportError:
                 raise ImportError('the rupture times need AlTar or fim-python: pip install fim-python')
         return engine
