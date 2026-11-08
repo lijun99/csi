@@ -842,7 +842,8 @@ class TriangularPatchesKin(TriangularPatches):
         of big G, so the data are bigG @ Mb: the rupture times of computeRuptureTimes, and the
         slip rate of each source point, a source time function of the rise time of its patch
         from its rupture time, averaged over the source points of the patch and sampled at the
-        start of each time step, times the slip of the patch along each rake
+        start of each time step, times the step and the slip of the patch along each rake: the
+        slip of the patch in each time step, as the columns of big G expect
 
         The slips along the rakes of buildKinGFs are the first two columns of {slip}, the rise
         times {tr} (s) and the rupture velocities {vr} (km/s), one for each patch
@@ -893,7 +894,7 @@ class TriangularPatchesKin(TriangularPatches):
             up = s < peak * Tr
             rate[inside] = np.where(up, 2 * s / (peak * Tr ** 2),
                                     2 * (Tr - s) / ((1 - peak) * Tr ** 2))
-        rate = rate.mean(axis=1)
+        rate = rate.mean(axis=1) * Dt
 
         # The slips along each rake
         slip = np.asarray(self.slip, dtype=float)[:, :2]
