@@ -332,16 +332,16 @@ class TriangularPatchesKin(TriangularPatches):
         return
 
     # ----------------------------------------------------------------------
-    def setSourcePoints(self, n):
+    def setSourcePoints(self, Npt):
         '''
-        The source points of each patch: the centroids of its n x n sub-triangles, n^2 points
-        that tile the patch evenly, in surface and in cartesian coordinates. The Green's functions
-        of a patch can sum their point sources (buildKinGFs with points), and AlTar interpolates
-        the rupture time at each of them, so a patch radiates over the time the front takes to
-        cross it
+        The source points of each patch: the centroids of its Npt x Npt sub-triangles, Npt^2
+        points that tile the patch evenly, in surface and in cartesian coordinates. The Green's
+        functions of a patch can sum their point sources (buildKinGFs with points), and AlTar
+        interpolates the rupture time at each of them, so a patch radiates over the time the front
+        takes to cross it
 
         Args:
-            * n         : the number of divisions of each edge
+            * Npt       : the number of divisions of each edge
 
         Returns:
             * None
@@ -352,11 +352,11 @@ class TriangularPatchesKin(TriangularPatches):
         # The barycentric coordinates of the centroids of the sub-triangles: those pointing up,
         # then, between them, those pointing down
         bary = []
-        for i in range(n):
-            for j in range(n - i):
-                bary.append(((i + 1 / 3) / n, (j + 1 / 3) / n))
-                if i + j < n - 1:
-                    bary.append(((i + 2 / 3) / n, (j + 2 / 3) / n))
+        for i in range(Npt):
+            for j in range(Npt - i):
+                bary.append(((i + 1 / 3) / Npt, (j + 1 / 3) / Npt))
+                if i + j < Npt - 1:
+                    bary.append(((i + 2 / 3) / Npt, (j + 2 / 3) / Npt))
         bary = np.array(bary)
         w = np.column_stack([1 - bary.sum(1), bary])
         self.sources_per_patch = w.shape[0]
@@ -685,15 +685,15 @@ class TriangularPatchesKin(TriangularPatches):
         return
 
     # ----------------------------------------------------------------------
-    def buildRuptureMesh(self, refine=10):
+    def buildRuptureMesh(self, Nmesh=10):
         '''
         The mesh of the rupture times, as AlTar's kinematic model on triangles makes it: each
-        patch cut into refine x refine triangles, which keep its index, the vertices on shared
+        patch cut into Nmesh x Nmesh triangles, which keep its index, the vertices on shared
         edges merged; and the triangle of this mesh that holds each source point, with its
         barycentric weights
 
         Kwargs:
-            * refine    : the triangles along each edge of a patch
+            * Nmesh     : the triangles along each edge of a patch
 
         Returns:
             * None
@@ -704,7 +704,7 @@ class TriangularPatchesKin(TriangularPatches):
 
         # The lattice of the small triangles in the barycentric coordinates of a patch: those
         # pointing up, then, between them, those pointing down
-        m = refine
+        m = Nmesh
         lattice = [(i, j) for i in range(m + 1) for j in range(m + 1 - i)]
         index = {ij: k for k, ij in enumerate(lattice)}
         L = np.array(lattice, dtype=float) / m
@@ -744,7 +744,7 @@ class TriangularPatchesKin(TriangularPatches):
         edges = xyz[triangles[:, [1, 2, 0]]] - xyz[triangles]
         spacing = np.sqrt((edges ** 2).sum(-1)).mean()
 
-        self.rupture_mesh = {'refine': refine, 'xyz': xyz, 'triangles': triangles,
+        self.rupture_mesh = {'Nmesh': Nmesh, 'xyz': xyz, 'triangles': triangles,
                              'patch': patch, 'corners': corners, 'weights': weights,
                              'spacing': spacing}
 
@@ -767,7 +767,7 @@ class TriangularPatchesKin(TriangularPatches):
         return np.stack([1 - l1 - l2, l1, l2], axis=-1)
 
     # ----------------------------------------------------------------------
-    def computeRuptureTimes(self, refine=10, device='cpu', engine='auto'):
+    def computeRuptureTimes(self, Nmesh=10, device='cpu', engine='auto'):
         '''
         The rupture times from the hypocenter (setHypoOnFault) and the rupture velocity of each
         patch, {vr} in km/s, as AlTar's kinematic model on triangles computes them: the eikonal
@@ -780,7 +780,7 @@ class TriangularPatchesKin(TriangularPatches):
         the cpu, fim-python otherwise
 
         Kwargs:
-            * refine    : the triangles along each edge of a patch
+            * Nmesh     : the triangles along each edge of a patch
             * device    : 'cpu' or 'gpu' (fim-python only, with cupy)
             * engine    : 'auto', 'altar' or 'fim'
 
@@ -792,15 +792,15 @@ class TriangularPatchesKin(TriangularPatches):
         assert self.hypo_uv is not None, 'set the hypocenter first'
         assert self.vr is not None, 'set the rupture velocities first'
         engine = self._ruptureEngine(engine, device)
-        if self.rupture_mesh is None or self.rupture_mesh['refine'] != refine:
-            self.buildRuptureMesh(refine)
+        if self.rupture_mesh is None or self.rupture_mesh['Nmesh'] != Nmesh:
+            self.buildRuptureMesh(Nmesh)
         mesh = self.rupture_mesh
         xyz, spacing = mesh['xyz'], mesh['spacing']
         vr = np.asarray(self.vr, dtype=float)
 
         # AlTar's compiled model
         if engine == 'altar':
-            self.sources_t0, mesh['times'] = self._slipHistory(refine).arrivals(vr, self.hypo_uv)
+            self.sources_t0, mesh['times'] = self._slipHistory(Nmesh).arrivals(vr, self.hypo_uv)
             return self.sources_t0
 
         # fim-python prints that cupy is missing on import, which only its gpu solver needs
@@ -836,7 +836,7 @@ class TriangularPatchesKin(TriangularPatches):
         return self.sources_t0
 
     # ----------------------------------------------------------------------
-    def castbigM(self, Nt, Dt, stf='triangle', peak=0.5, refine=10, device='cpu', engine='auto'):
+    def castbigM(self, Nt, Dt, stf='triangle', peak=0.5, Nmesh=10, device='cpu', engine='auto'):
         '''
         The slip history Mb of AlTar's kinematic model on triangles, in the order of the columns
         of big G, so the data are bigG @ Mb: the rupture times of computeRuptureTimes, and the
@@ -854,7 +854,7 @@ class TriangularPatchesKin(TriangularPatches):
         Kwargs:
             * stf       : the source time function, 'triangle' or 'cosine' (a raised cosine)
             * peak      : where the triangle peaks, as a fraction of the rise time
-            * refine    : the triangles along each edge of a patch, for the rupture times
+            * Nmesh     : the triangles along each edge of a patch, for the rupture times
             * device    : 'cpu' or 'gpu' (fim-python only, with cupy)
             * engine    : 'auto', 'altar' or 'fim', as for computeRuptureTimes
 
@@ -871,13 +871,13 @@ class TriangularPatchesKin(TriangularPatches):
         # AlTar's compiled model, and the rupture times from it
         engine = self._ruptureEngine(engine, device)
         if engine == 'altar':
-            history = self._slipHistory(refine, Nt, Dt, stf, peak)
-            self.computeRuptureTimes(refine=refine, device=device, engine=engine)
+            history = self._slipHistory(Nmesh, Nt, Dt, stf, peak)
+            self.computeRuptureTimes(Nmesh=Nmesh, device=device, engine=engine)
             return history(np.asarray(self.slip, dtype=float)[:, :2], self.tr, self.vr,
                            self.hypo_uv).ravel()
 
         # The rupture times
-        T0 = self.computeRuptureTimes(refine=refine, device=device, engine=engine).reshape(Np, Nsp)
+        T0 = self.computeRuptureTimes(Nmesh=Nmesh, device=device, engine=engine).reshape(Np, Nsp)
 
         # The time since the rupture time of each source point, at the start of each time step
         s = Dt * np.arange(Nt)[None, None, :] - T0[:, :, None]
@@ -929,18 +929,18 @@ class TriangularPatchesKin(TriangularPatches):
         return engine
 
     # ----------------------------------------------------------------------
-    def _slipHistory(self, refine, Nt=None, Dt=None, stf='triangle', peak=0.5):
+    def _slipHistory(self, Nmesh, Nt=None, Dt=None, stf='triangle', peak=0.5):
         '''
         AlTar's slip history of the patches, kept until the mesh, the source points or the
-        settings change; any one with the same {refine} for the rupture times alone ({Nt} None)
+        settings change; any one with the same {Nmesh} for the rupture times alone ({Nt} None)
         '''
         from altar.models.seismic.history import SlipHistory
-        key = (refine, Nt, Dt, stf, peak)
+        key = (Nmesh, Nt, Dt, stf, peak)
         cached = self.slip_history
-        if cached is not None and (cached[0] == key or (Nt is None and cached[0][0] == refine)):
+        if cached is not None and (cached[0] == key or (Nt is None and cached[0][0] == Nmesh)):
             return cached[1]
         history = SlipHistory(self.Vertices, self.Faces, self.uv, self.sources_uv,
-                              self.sources_patch, Nt=Nt or 1, dt=Dt or 1.0, refine=refine,
+                              self.sources_patch, Nt=Nt or 1, dt=Dt or 1.0, Nmesh=Nmesh,
                               stf=stf, peak=peak)
         self.slip_history = (key, history)
         return history
